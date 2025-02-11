@@ -1,0 +1,338 @@
+
+var bands = ee.List(['nir','swir1','NDVI','EVI','LSWI','NDSVI','NDTI','REP','GWCCI1','GWCCI2',
+'NDWI','NDBI','NDSI','NBR','SAVI',
+'blue', 'green', 'red','red1','red2','red3','red4', 'swir2'])  
+
+var region = ee.FeatureCollection('users/seventy/Emmet');
+// Step 1: Construct feature candicates from Sentinel-2 images
+var year=2023
+var startDay = ee.Date.fromYMD(year,1,1)
+var endDay = ee.Date.fromYMD(year+1,1,1)
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var SR = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(region)
+  .filterDate(startDay,endDay)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',80))
+  .linkCollection(csPlus, ['cs_cdf'])
+  .map(sentinel2toa)
+  .map(addVariables) 
+  .map(cloudMask)
+
+var s2filtered = SR.select(bands)
+
+print(s2filtered )
+  
+  
+// month composite
+var LIC = ee.List.sequence(0, 1*11,1).map(function(n) {
+  var doy = n
+  var start = ee.Date.fromYMD(year,1,1).advance(n, 'month');
+  var end = start.advance(1, 'month');
+  var filtered = s2filtered.filterDate(start, end).median().clip(region)
+  var bandLength = filtered.bandNames().length()
+  var mask = ee.Algorithms.If({                   // mask must be done for time band
+    condition : ee.Number(bandLength).gt(0),
+    trueCase : filtered.select(0).mask(),
+    falseCase : ee.Image(0).clip(region)    
+  })
+  return filtered.addBands(ee.Image.constant(doy).rename('doy').float())
+                .updateMask(mask)
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).advance(doy,'day').millis())
+                .set('doy',doy)
+                .set('length',bandLength)   
+
+}).flatten();
+var LIC = ee.ImageCollection.fromImages(LIC);
+
+// 2) Linear interpolation --------------------------------------------
+var size = LIC.size()
+var LIC = LIC.toList(size)
+var interpolated = ee.ImageCollection(ee.List.sequence(3,9,1).map(function(i){
+  var i = ee.Number(i)
+  var before = ee.ImageCollection.fromImages(LIC.slice(i.subtract(2),i))
+    .filter(ee.Filter.gt('length',0)).mosaic()
+  var after = ee.ImageCollection.fromImages(LIC.slice(i.add(1),i.add(3)).reverse())
+    .filter(ee.Filter.gt('length',0)).mosaic()
+  var boforeY = before.select(bands)
+  var beforedoy = before.select('doy')
+  var afterY = after.select(bands)
+  var afterdoy = after.select('doy')
+  var targetImg = ee.Image(LIC.get(i))
+  var currentdoy = ee.Image.constant(targetImg.get('doy')).float();
+  var Y = afterY.subtract(boforeY).divide(afterdoy.subtract(beforedoy))
+      .multiply(currentdoy.subtract(beforedoy)).add(boforeY)
+  var filledImage = ee.Image(ee.Algorithms.If({
+    condition : ee.Number(targetImg.get('length')).gt(0), 
+    trueCase : targetImg.select(bands).unmask(Y),
+    falseCase : Y
+  }));
+  return filledImage.unmask(0).clip(region)
+    .set('system:time_start',targetImg.get('system:time_start'),'doy',targetImg.get('doy')) // can not simply copy all properties of composites
+}))  
+
+// 3) smoothing --------------------------------------------
+
+var WScollection =ee.ImageCollection([])
+for(var i=0;i<10;i++){
+  var band = bands.get(i)
+  var bandCollection = interpolated.select(ee.List([band]))
+  var bandName = bandCollection.map(function(img){return img.unmask(bandCollection.mean())})
+  var bandName = whittakerSmoothing(bandName)[0]
+  var newband = ee.List([band]).get(0).getInfo()+'_fitted'
+  var collection = bandName.select(ee.List([newband]))
+  var WScollection = WScollection.merge(collection)
+}
+
+
+var finalImage = ee.Image(WScollection.iterate(mergeBands, ee.Image([])))
+print(finalImage)
+
+Export.image.toAsset({
+		image:finalImage,
+	  description:'finalImage',
+	  assetId:'finalImage',
+	  region:region,
+  	scale:10,
+  	crs:"EPSG:4326",
+  	maxPixels: 1e13
+})
+
+
+
+
+
+
+
+
+
+//////////////// Functions //////////////////////////////////////////
+// rename Sentinel-2 bands
+// set necessary properties
+function sentinel2toa (img){
+  return img.select(
+                      ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9', 'B11','B12','QA60','cs_cdf']
+                      ,['aerosol', 'blue', 'green', 'red','red1','red2','red3','nir','red4','h2o','swir1', 'swir2','QA60','cs_cdf']
+                    ).divide(10000).toDouble()
+                    .set('solar_azimuth',img.get('MEAN_SOLAR_AZIMUTH_ANGLE'))
+                    .set('solar_zenith',img.get('MEAN_SOLAR_ZENITH_ANGLE') )
+                    .set('system:time_start',img.get('system:time_start'));
+}
+
+// function to get cloud score
+// simply the cloud_and_shadow_mask
+function cloudMask(toa) {
+
+  var mask= toa.select('cs_cdf').gte(0.00006)
+  return toa.updateMask(mask).addBands(mask.rename('mask'))
+
+} 
+
+// Use this function to add several indices to Sentinel-2 imagery.
+function addVariables(image) {
+  var DOY = image.date().getRelative('day', 'year')
+  var year = image.date().get('year')
+  return image
+    // Add a NDVI band.
+    .addBands(image.normalizedDifference(['nir', 'red']).toDouble().rename('NDVI'))
+    // Add a EVI band.
+    .addBands(image.expression('2.5*((nir-red)/(nir+6*red-7.5*blue+1))', {
+      'nir':image.select('nir'),
+      'red':image.select('red'),
+      'blue':image.select('blue')
+    }).toDouble().rename('EVI'))
+    // Add a GCVI: Green Chlorophyll Vegetation Index (Guan Kaiyu, Wang Sherrie)
+    .addBands(image.expression('nir/green-1',{
+      'nir': image.select('nir'),
+      'green': image.select('green'),
+    }).toDouble().rename('GCVI'))
+    .addBands(image.expression('(nir-red)/(nir+red)*swir1',{
+      'nir': image.select('nir'),
+      'red': image.select('red'),
+      'swir1': image.select('swir1')
+    }).toDouble().rename('GWCCI1'))
+    .addBands(image.expression('(nir-red)/(nir+red)*nir',{
+      'nir': image.select('nir'),
+      'red': image.select('red'),
+      'nir': image.select('nir')
+    }).toDouble().rename('GWCCI2'))
+    // Add a LSWI band.
+    .addBands(image.normalizedDifference(['nir','swir1']).toDouble().rename('LSWI'))
+    .addBands(image.expression('(705+35*(0.5*(red3+red)-red1)/(red2-red1))/1000',{
+      'red3' : image.select('red3'),
+      'red2' : image.select('red2'),
+      'red1' : image.select('red1'),
+      'red' : image.select('red'),
+    }).toDouble().rename('REP'))
+    .addBands(image.expression('(nir-red)/(nir+red+0.5)*1.5',{
+      'nir': image.select('nir'),
+      'red': image.select('red'),
+    }).toDouble().rename('SAVI'))
+    .addBands(image.expression('(red3-red)/red1/red2',{
+      'red3' : image.select('red3'),
+      'red2' : image.select('red2'),
+      'red1' : image.select('red1'),
+      'red' : image.select('red'),
+    }).toDouble().rename('IRECI'))
+        // Add NDSVI: normalized differential senescent vegetation index (Zhong,2014)
+    .addBands(image.normalizedDifference(['swir1','red']).toDouble().rename('NDSVI'))
+    // Add NDTI: normalized differential tillage index, relates to residue cover (Zhong,2014)
+    .addBands(image.normalizedDifference(['swir1','swir2']).toDouble().rename('NDTI'))
+    .addBands(image.normalizedDifference(['nir','swir1']).toDouble().rename('NDWI'))
+    .addBands(image.normalizedDifference(['swir1','nir']).toDouble().rename('NDBI'))
+    .addBands(image.normalizedDifference(['green','swir1']).toDouble().rename('NDSI'))
+    .addBands(image.normalizedDifference(['nir','swir2']).toDouble().rename('NBR'))
+
+
+    // add a doy band.
+    .addBands(ee.Image(DOY).rename('DOY').toDouble())
+    // add a year band.
+    .addBands(ee.Image(year).rename('Year').toDouble())
+
+    .set('DOY',DOY)
+}
+
+function mergeBands(image, previous) {
+  return ee.Image(previous).addBands(image);
+};
+// helper function to convert qa bit image to flag
+function extractBits(image, start, end, newName) {
+    // Compute the bits we need to extract.
+    var pattern = 0;
+    for (var i = start; i <= end; i++) {
+       pattern += Math.pow(2, i);
+    }
+    // Return a single band image of the extracted QA bits, giving the band
+    // a new name.
+    return image.select([0], [newName])
+                  .bitwiseAnd(pattern)
+                  .rightShift(start);
+}
+ 
+// function to get a Difference mattrix of specified order
+// on the input matrix. takes matrix and order as parameters
+function getDifferenceMatrix(inputMatrix, order){
+    var rowCount = ee.Number(inputMatrix.length().get([0]));
+    var left = inputMatrix.slice(0,0,rowCount.subtract(1));
+    var right = inputMatrix.slice(0,1,rowCount);
+    if (order > 1 ){
+        return getDifferenceMatrix(left.subtract(right), order-1)}
+    return left.subtract(right);
+};
+ 
+// unpacks an array image into images and bands
+// takes an array image, list of image IDs and list of band names as arguments
+function unpack(arrayImage, imageIds, bands){
+     
+    function iter(item, icoll){
+         
+        function innerIter(innerItem, innerList){
+            return ee.List(innerList).add(ee.String(item).cat("_").cat(ee.String(innerItem)))}
+         
+        var temp = bands.iterate(innerIter, ee.List([]));
+        return ee.ImageCollection(icoll)
+            .merge(ee.ImageCollection(ee.Image(arrayImage).select(temp,bands).set("id",item)))}
+ 
+    var imgcoll  = ee.ImageCollection(imageIds.iterate(iter, ee.ImageCollection([])));
+    return imgcoll}
+ 
+ 
+ 
+// Function to compute the inverse log ratio of a regression results to 
+// transform back to percent units
+function inverseLogRatio(image) {
+  var bands = image.bandNames();
+  var t = image.get("system:time_start");
+  var ilrImage = ee.Image(100).divide(ee.Image(1).add(image.exp())).rename(bands);
+  return ilrImage.set("system:time_start",t);
+}
+ 
+function whittakerSmoothing(imageCollection, isCompositional, lambda){
+  // quick configs to set defaults
+  if (isCompositional === undefined || isCompositional !==true) isCompositional = false;
+  if (lambda === undefined ) lambda = 10;
+ 
+  // procedure start  
+  var ic = imageCollection.map(function(image){
+     var t = image.get("system:time_start");
+    return image.toFloat().set("system:time_start",t);
+  });
+ 
+  var dimension = ic.size();
+  var identity_mat = ee.Array.identity(dimension);
+  var difference_mat = getDifferenceMatrix(identity_mat,3);
+  var difference_mat_transpose = difference_mat.transpose();
+  var lamda_difference_mat = difference_mat_transpose.multiply(lambda);
+  var res_mat = lamda_difference_mat.matrixMultiply(difference_mat);
+  var hat_matrix = res_mat.add(identity_mat);
+ 
+   
+  // backing up original data
+  var original = ic;
+ 
+  // get original image properties
+  var properties = ee.List(ic.iterate(function(image, list){
+    return ee.List(list).add(image.toDictionary());
+  },[]));
+   
+  var time = ee.List(ic.iterate(function(image, list){
+    return ee.List(list).add(image.get("system:time_start"));
+  },[]));
+   
+  // if data is compositional
+  // calculate the logratio of an image between 0 and 100. First
+  // clamps between delta and 100-delta, where delta is a small positive value.
+  if (isCompositional){
+    ic = ic.map(function(image){
+      var t = image.get("system:time_start");
+      var delta = 0.001;
+      var bands = image.bandNames();
+      image = image.clamp(delta,100-delta);
+      image = (ee.Image.constant(100).subtract(image)).divide(image).log().rename(bands);
+      return image.set("system:time_start",t);
+    });
+  }
+ 
+  var arrayImage = original.toArray();
+  var coeffimage = ee.Image(hat_matrix);
+  var smoothImage = coeffimage.matrixSolve(arrayImage);
+   
+  var idlist = ee.List(ic.iterate(function(image, list){
+    return ee.List(list).add(image.id());
+  },[]));
+  var bandlist = ee.Image(ic.first()).bandNames();
+   
+  var flatImage = smoothImage.arrayFlatten([idlist,bandlist]);
+  var smoothCollection = ee.ImageCollection(unpack(flatImage, idlist, bandlist));
+   
+  if (isCompositional){
+    smoothCollection = smoothCollection.map(inverseLogRatio);
+  }
+  // get new band names by adding suffix fitted
+  var newBandNames = bandlist.map(function(band){return ee.String(band).cat("_fitted")});
+  // rename the bands in smoothened images
+  smoothCollection = smoothCollection.map(function(image){return ee.Image(image).rename(newBandNames)});
+   
+  // a really dumb way to loose the google earth engine generated ID so that the two
+  // images can be combined for the chart
+  var dumbimg = arrayImage.arrayFlatten([idlist,bandlist]);
+  var dumbcoll = ee.ImageCollection(unpack(dumbimg,idlist, bandlist));
+  var outCollection = dumbcoll.combine(smoothCollection);
+   
+  var outCollectionProp = outCollection.iterate(function(image,list){
+      var t = image.get("system:time_start")
+    return ee.List(list).add(image.set(properties.get(ee.List(list).size())));
+  },[]);
+ 
+  var outCollectionProp = outCollection.iterate(function(image,list){
+    return ee.List(list).add(image.set("system:time_start",time.get(ee.List(list).size())));
+  },[]);
+ 
+ 
+  var residue_sq = smoothImage.subtract(arrayImage).pow(ee.Image(2)).divide(dimension);
+  var rmse_array = residue_sq.arrayReduce(ee.Reducer.sum(),[0]).pow(ee.Image(1/2));
+   
+  var rmseImage = rmse_array.arrayFlatten([["rmse"],bandlist]);
+   
+  return [ee.ImageCollection.fromImages(outCollectionProp), rmseImage];
+}
+
